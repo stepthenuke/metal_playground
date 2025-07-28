@@ -102,8 +102,8 @@ int main()
    constexpr u64 posDataSize = numVertices * sizeof(simd::float3);
    constexpr u64 colDataSize = numVertices * sizeof(simd::float3);
 
-   MTL::Buffer *vertexPosBuffer = device->newBuffer(posDataSize, MTL::ResourceStorageModeShared);
-   MTL::Buffer *vertexColBuffer = device->newBuffer(colDataSize, MTL::ResourceStorageModeShared);
+   MTL::Buffer *vertexPosBuffer = device->newBuffer(posDataSize, MTL::ResourceStorageModeManaged);
+   MTL::Buffer *vertexColBuffer = device->newBuffer(colDataSize, MTL::ResourceStorageModeManaged);
 
    memcpy(vertexPosBuffer->contents(), positions, posDataSize);
    memcpy(vertexColBuffer->contents(), colors, colDataSize);
@@ -120,6 +120,8 @@ int main()
             quit = true;
          }
       }
+
+      NS::AutoreleasePool *insidePool = NS::AutoreleasePool::alloc()->init();
 
       CA::MetalDrawable *drawable = layer->nextDrawable();
 
@@ -139,6 +141,8 @@ int main()
       encoder->endEncoding();
       commandBuffer->presentDrawable(drawable);
       commandBuffer->commit();
+
+      insidePool->release();
    }
 
    pool->release();

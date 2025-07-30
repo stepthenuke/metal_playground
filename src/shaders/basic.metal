@@ -1,23 +1,34 @@
 #include <metal_stdlib>
 using namespace metal;
 
-struct v2f
+#include "../common/shader_types.h"
+
+struct RasterizerData
 {
    float4 position [[position]];
-   half3 color;
+   float4 color;
 };
 
-v2f vertex vertexMain( uint vertexId [[vertex_id]],
-                        device const float3* positions [[buffer(0)]],
-                        device const float3* colors [[buffer(1)]] )
+vertex RasterizerData
+vertexShader(uint vertexID [[vertex_id]],
+             constant VertexData *vertexData [[buffer(InputBufferIndexForVertexData)]],
+             constant simd_uint2 *viewportSizePointer [[buffer(InputBufferIndexForViewportSize)]])
 {
-   v2f o;
-   o.position = float4( positions[ vertexId ], 1.0 );
-   o.color = half3 ( colors[ vertexId ] );
-   return o;
+   RasterizerData out;
+   
+   simd_float2 pixelSpacePosition = vertexData[vertexID].position.xy;
+   simd_float2 viewportSize = simd_float2(*viewportSizePointer);
+
+   out.position.xy = pixelSpacePosition / (viewportSize / 2.0);
+   out.position.z = 0.0;
+   out.position.w = 1.0;
+   
+   out.color = vertexData[vertexID].color;
+
+   return out;
 }
 
-half4 fragment fragmentMain( v2f in [[stage_in]] )
+fragment float4 fragmentShader(RasterizerData in [[stage_in]])
 {
-   return half4( in.color, 1.0 );
+   return in.color;
 }

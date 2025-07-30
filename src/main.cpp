@@ -19,10 +19,60 @@
 
 #include <simd/simd.h>
 
+#include <unistd.h>
 #include <stdio.h>
 #include <string.h>
 
+#include "common/shader_types.h"
+
 using NS::StringEncoding::UTF8StringEncoding;
+
+constexpr u32 maxFramesInFlights = 3;
+simd_uint2 viewportSize = {960, 960};
+
+const simd_float4 red = { 1.0, 0.0, 0.0, 1.0 };
+const simd_float4 green = { 0.0, 1.0, 0.0, 1.0 };
+const simd_float4 blue = { 0.0, 0.0, 1.0, 1.0 };
+
+typedef struct TriangleData {
+    VertexData vertex0;
+    VertexData vertex1;
+    VertexData vertex2;
+}
+TriangleData;
+
+void triangleRedGreenBlue(float radius,
+                          float rotationInDegrees,
+                          TriangleData *triangleData)
+{
+    const float angle0 = (float)rotationInDegrees * M_PI / 180.0f;
+    const float angle1 = angle0 + (2.0f * M_PI  / 3.0f);
+    const float angle2 = angle0 + (4.0f * M_PI  / 3.0f);
+
+    simd_float2 position0 = {
+        radius * cosf(angle0),
+        radius * sinf(angle0)
+    };
+
+    simd_float2 position1 = {
+        radius * cosf(angle1),
+        radius * sinf(angle1)
+    };
+
+    simd_float2 position2 = {
+        radius * cosf(angle2),
+        radius * sinf(angle2)
+    };
+
+    triangleData->vertex0.color = red;
+    triangleData->vertex0.position = position0;
+
+    triangleData->vertex1.color = green;
+    triangleData->vertex1.position = position1;
+
+    triangleData->vertex2.color = blue;
+    triangleData->vertex2.position = position2;
+}
 
 static bool sdlInit()
 {
@@ -31,6 +81,35 @@ static bool sdlInit()
    }
    fprintf(stderr, "Can't init SDL: %s", SDL_GetError());
    return false;
+}
+
+static void dumpInfo(MTL::Device *device)
+{
+   printf("Device name: %s\n", device->name()->cString(UTF8StringEncoding));
+
+   MTL::GPUFamily families[9] = {
+      MTL::GPUFamilyApple9, MTL::GPUFamilyApple8, MTL::GPUFamilyApple7, 
+      MTL::GPUFamilyApple6, MTL::GPUFamilyApple5, MTL::GPUFamilyApple4,
+      MTL::GPUFamilyApple3, MTL::GPUFamilyApple2, MTL::GPUFamilyApple1,
+   };
+   for (int idx = 0; idx < 9; ++idx) {
+      if (device->supportsFamily(families[idx])) {
+         printf("Device family: Apple%d\n", 9 - idx);
+         break;
+      }
+   }
+   printf("Raytraycing support: %d\n", device->supportsRaytracing());
+}
+
+void setVertexData(MTL::Buffer *buffer, int frameNumber)
+{
+   constexpr float radius = 350.0f;
+   u32 rotation = frameNumber % 360;
+
+   TriangleData triangleData;
+   triangleRedGreenBlue(radius, rotation, &triangleData);
+   
+   memcpy(buffer->contents(), &triangleData, sizeof(TriangleData));
 }
 
 int main()
@@ -53,63 +132,136 @@ int main()
    NS::AutoreleasePool *pool = NS::AutoreleasePool::alloc()->init();
 
    MTL::Device *device = MTL::CreateSystemDefaultDevice();
+
+   dumpInfo(device);
+
    SDL_MetalView sdlView = SDL_Metal_CreateView(mainWindow);
    CA::MetalLayer *layer = (CA::MetalLayer *) SDL_Metal_GetLayer(sdlView);
    layer->setDevice(device);
-   layer->setPixelFormat(MTL::PixelFormatBGRA8Unorm_sRGB);
+   layer->setPixelFormat(MTL::PixelFormatBGRA8Unorm);
 
-   MTL::CommandQueue *commandQueue = device->newCommandQueue();
+   /* init */
+   int frameNumber = 0;
 
-   /* load shaders */
+   MTL4::CommandQueue *commandQueue = device->newMTL4CommandQueue();
+   MTL4::CommandBuffer *commandBuffer = device->newCommandBuffer();
+
+   /* create render pipeline state */
    NS::Error *error = NULL;
+
    MTL::Library *library = device->newLibrary(NS::String::string("Shaders.metallib", UTF8StringEncoding), &error);
    if (!library) {
-      fprintf(stderr, "%s", error->localizedDescription()->utf8String());
+      fprintf(stderr, "%s", error ? error->localizedDescription()->utf8String() : "unknown");
+      exit(1);
+   }      
+
+   /* Check if archive exists and load if so */
+   const char *archivePath = "Archive.mta";
+   NS::URL *archiveURL = (access(archivePath, F_OK) == 0) ? NS::URL::fileURLWithPath(NS::String::string("Archive.mta", UTF8StringEncoding)) : NULL;
+   MTL4::Archive *defaultArchive = NULL;
+   if (archiveURL) {
+      defaultArchive = device->newArchive(archiveURL, &error);
+      if (!defaultArchive) {
+         fprintf(stderr, "%s", error ? error->localizedDescription()->utf8String() : "unknown");
+         exit(1);
+      }
+   }
+
+   MTL4::CompilerDescriptor *compilerDescriptor = MTL4::CompilerDescriptor::alloc()->init();
+   MTL4::Compiler *compiler = device->newCompiler(compilerDescriptor, &error);
+   if (!compiler) {
+      fprintf(stderr, "%s", error ? error->localizedDescription()->utf8String() : "unknown");
       exit(1);
    }
 
-   MTL::Function *vertexFn = library->newFunction(NS::String::string("vertexMain", UTF8StringEncoding));
-   MTL::Function *fragmentFn = library->newFunction(NS::String::string("fragmentMain", UTF8StringEncoding));
-   
-   MTL::RenderPipelineDescriptor *pipelineDesc = MTL::RenderPipelineDescriptor::alloc()->init();
-   pipelineDesc->setVertexFunction(vertexFn);
-   pipelineDesc->setFragmentFunction(fragmentFn);
-   pipelineDesc->colorAttachments()->object(0)->setPixelFormat(MTL::PixelFormat::PixelFormatBGRA8Unorm_sRGB);
+   MTL4::RenderPipelineDescriptor *renderPipelineDescriptor = MTL4::RenderPipelineDescriptor::alloc()->init();
+   renderPipelineDescriptor->setLabel(NS::String::string("MTL 4 render pipeline", UTF8StringEncoding));
 
-   MTL::RenderPipelineState *pipeline = device->newRenderPipelineState(pipelineDesc, &error);
+   MTL4::LibraryFunctionDescriptor *vertexFunction = MTL4::LibraryFunctionDescriptor::alloc()->init();
+   vertexFunction->setLibrary(library);
+   vertexFunction->setName(NS::String::string("vertexShader", UTF8StringEncoding));
+   renderPipelineDescriptor->setVertexFunctionDescriptor(vertexFunction);
+
+   MTL4::LibraryFunctionDescriptor *fragmentFunction = MTL4::LibraryFunctionDescriptor::alloc()->init();
+   fragmentFunction->setLibrary(library);
+   fragmentFunction->setName(NS::String::string("fragmentShader", UTF8StringEncoding));
+   renderPipelineDescriptor->setFragmentFunctionDescriptor(fragmentFunction);
+
+   renderPipelineDescriptor->colorAttachments()->object(0)->setPixelFormat(MTL::PixelFormat::PixelFormatBGRA8Unorm);
+
+   MTL4::CompilerTaskOptions *compilerTaskOptions = MTL4::CompilerTaskOptions::alloc()->init();
+   if (defaultArchive) {
+      const NS::Object *archivesObjects = { defaultArchive };
+      NS::Array *archives = NS::Array::array(archivesObjects);
+      compilerTaskOptions->setLookupArchives(archives);
+   }
+
+   MTL::RenderPipelineState *pipeline = compiler->newRenderPipelineState(renderPipelineDescriptor, compilerTaskOptions, &error);
    if (!pipeline) {
-      fprintf(stderr, "%s", error->localizedDescription()->utf8String());
+      fprintf(stderr, "%s", error ? error->localizedDescription()->utf8String() : "unknown");
       exit(1);
    }
 
-   /* setup buffers */
-   constexpr u64 numVertices = 3;
+   /* create buffers */
+   MTL::Buffer *vertexBuffers[maxFramesInFlights] {};
 
-   static constexpr simd::float3 positions[numVertices] =
-   {
-      { -0.8f,  0.8f, 0.0f },
-      {  0.0f, -0.8f, 0.0f },
-      { +0.8f,  0.8f, 0.0f }
-   };
+   for (i32 bufIdx = 0; bufIdx < maxFramesInFlights; ++bufIdx) {
+      vertexBuffers[bufIdx] = device->newBuffer(sizeof(TriangleData), MTL::ResourceStorageModeShared);
+   }
+   MTL::Buffer *viewportSizeBuffer = device->newBuffer(sizeof(viewportSize), MTL::ResourceStorageModeShared);
 
-   static constexpr simd::float3 colors[numVertices] =
-   {
-      {  1.0, 0.3f, 0.2f },
-      {  0.8f, 1.0, 0.0f },
-      {  0.8f, 0.0f, 1.0 }
-   };
+   /* create argument table */
+   MTL4::ArgumentTableDescriptor *argumentTableDescriptor = MTL4::ArgumentTableDescriptor::alloc()->init();
+   argumentTableDescriptor->setMaxBufferBindCount(2);
 
-   constexpr u64 posDataSize = numVertices * sizeof(simd::float3);
-   constexpr u64 colDataSize = numVertices * sizeof(simd::float3);
+   MTL4::ArgumentTable *argumentTable = device->newArgumentTable(argumentTableDescriptor, &error);
+   if (!argumentTable) {
+      fprintf(stderr, "%s", error ? error->localizedDescription()->utf8String() : "unknown");
+      exit(1);
+   }
 
-   MTL::Buffer *vertexPosBuffer = device->newBuffer(posDataSize, MTL::ResourceStorageModeManaged);
-   MTL::Buffer *vertexColBuffer = device->newBuffer(colDataSize, MTL::ResourceStorageModeManaged);
+   /* create residency set */
+   MTL::ResidencySetDescriptor *residencySetDescriptor = MTL::ResidencySetDescriptor::alloc()->init();
 
-   memcpy(vertexPosBuffer->contents(), positions, posDataSize);
-   memcpy(vertexColBuffer->contents(), colors, colDataSize);
+   MTL::ResidencySet *residencySet = device->newResidencySet(residencySetDescriptor, &error);
+   if (!residencySet) {
+      fprintf(stderr, "%s", error ? error->localizedDescription()->utf8String() : "unknown");
+      exit(1);
+   }
 
-   vertexPosBuffer->didModifyRange(NS::Range(0, vertexPosBuffer->length()));
-   vertexPosBuffer->didModifyRange(NS::Range(0, vertexColBuffer->length()));
+   /* create command allocators */
+   MTL4::CommandAllocator *commandAllocators[maxFramesInFlights] {};
+
+   for (i32 frameIdx = 0; frameIdx < maxFramesInFlights; ++frameIdx) {
+      MTL4::CommandAllocator *allocator = device->newCommandAllocator();
+      if (!allocator) {
+         fprintf(stderr, "%s", "CommandAllocator cannot be created");
+         exit(1);
+      }
+      commandAllocators[frameIdx] = allocator;
+   }
+
+
+   /* configure residency sets */
+   commandQueue->addResidencySet(residencySet);
+   commandQueue->addResidencySet(layer->residencySet());
+
+   residencySet->addAllocation(viewportSizeBuffer);
+   for (i32 bufIdx = 0; bufIdx < maxFramesInFlights; ++bufIdx) {
+      residencySet->addAllocation(vertexBuffers[bufIdx]);
+   }
+
+   residencySet->commit();
+
+   /* create shared event */
+   MTL::SharedEvent *sharedEvent = device->newSharedEvent();
+   sharedEvent->setSignaledValue(frameNumber);
+
+   /* update viewport size */
+   viewportSize.x = layer->drawableSize().width;
+   viewportSize.y = layer->drawableSize().height;
+
+   memcpy(viewportSizeBuffer->contents(), &viewportSize, sizeof(viewportSize));
 
    /* draw */
    SDL_Event e;
@@ -124,23 +276,71 @@ int main()
       NS::AutoreleasePool *insidePool = NS::AutoreleasePool::alloc()->init();
 
       CA::MetalDrawable *drawable = layer->nextDrawable();
+      if (!drawable) {
+         continue;
+      }
 
-      MTL::CommandBuffer *commandBuffer = commandQueue->commandBuffer();
-      MTL::RenderPassDescriptor *passDesc = MTL::RenderPassDescriptor::renderPassDescriptor();
-      passDesc->colorAttachments()->object(0)->setLoadAction(MTL::LoadActionClear);
-      passDesc->colorAttachments()->object(0)->setStoreAction(MTL::StoreActionStore);
-      passDesc->colorAttachments()->object(0)->setClearColor(MTL::ClearColor(0.2, 0.2, 0.2, 1.0));
-      passDesc->colorAttachments()->object(0)->setTexture(drawable->texture());
+      /* set up render pass descriptor as we don't have MTK::View, but have a CAMetalLayer */
+      MTL4::RenderPassDescriptor *renderPassDescriptor = MTL4::RenderPassDescriptor::alloc()->init();
+      renderPassDescriptor->colorAttachments()->object(0)->setLoadAction(MTL::LoadActionClear);
+      renderPassDescriptor->colorAttachments()->object(0)->setStoreAction(MTL::StoreActionStore);
+      renderPassDescriptor->colorAttachments()->object(0)->setClearColor(MTL::ClearColor(0.2, 0.2, 0.2, 1.0));
+      renderPassDescriptor->colorAttachments()->object(0)->setTexture(drawable->texture());
 
-      MTL::RenderCommandEncoder *encoder = commandBuffer->renderCommandEncoder(passDesc);
-      encoder->setRenderPipelineState(pipeline);
-      encoder->setVertexBuffer(vertexPosBuffer, 0, 0);
-      encoder->setVertexBuffer(vertexColBuffer, 0, 1);
-      encoder->drawPrimitives(MTL::PrimitiveTypeTriangle, NS::UInteger(0), NS::UInteger(numVertices));
+      frameNumber += 1;
 
-      encoder->endEncoding();
-      commandBuffer->presentDrawable(drawable);
-      commandBuffer->commit();
+      char frameStrBuffer[64];
+      snprintf(frameStrBuffer, 64, "Frame %d", frameNumber); 
+      NS::String *frameString = NS::String::string(frameStrBuffer, UTF8StringEncoding);
+
+      if (frameNumber >= maxFramesInFlights) {
+         u64 previousValueToWaitFor = frameNumber - maxFramesInFlights;
+         sharedEvent->waitUntilSignaledValue(previousValueToWaitFor, 10);
+      }
+
+      u32 frameIdx = frameNumber % maxFramesInFlights;
+      MTL4::CommandAllocator *frameAllocator = commandAllocators[frameIdx];
+      frameAllocator->reset();
+
+      commandBuffer->beginCommandBuffer(frameAllocator);
+      commandBuffer->setLabel(frameString);
+
+      MTL4::RenderCommandEncoder *renderEncoder = commandBuffer->renderCommandEncoder(renderPassDescriptor);
+      renderEncoder->setLabel(frameString);
+      
+      MTL::Viewport viewPort;
+      viewPort.originX = 0.0;
+      viewPort.originY = 0.0;
+      viewPort.width = (double)viewportSize.x;
+      viewPort.height = (double)viewportSize.y;
+      viewPort.znear = 0.0;
+      viewPort.zfar = 1.0;
+
+      renderEncoder->setViewport(viewPort);
+
+      renderEncoder->setRenderPipelineState(pipeline);
+
+      renderEncoder->setArgumentTable(argumentTable, MTL::RenderStageVertex);
+
+      MTL::Buffer *vertexBuffer = vertexBuffers[frameIdx];
+      setVertexData(vertexBuffer, frameNumber);
+
+      argumentTable->setAddress(vertexBuffer->gpuAddress(), InputBufferIndexForVertexData);
+      argumentTable->setAddress(viewportSizeBuffer->gpuAddress(), InputBufferIndexForViewportSize);
+
+      renderEncoder->drawPrimitives(MTL::PrimitiveTypeTriangle, 0, 3);
+      renderEncoder->endEncoding();
+
+      commandBuffer->endCommandBuffer();
+
+      commandQueue->wait(drawable);
+      MTL4::CommandBuffer *commandBuffers[] = {commandBuffer};
+      commandQueue->commit(commandBuffers, 1);
+      commandQueue->signalDrawable(drawable);
+
+      drawable->present();
+
+      commandQueue->signalEvent(sharedEvent, frameNumber); 
 
       insidePool->release();
    }
